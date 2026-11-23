@@ -109,7 +109,8 @@ jobs:
               trigger="The \`claude-fix\` label was added. Read the latest automated review comment on the PR
           (the one containing '<!-- claude-review') with: gh pr view ${NUMBER} --repo ${REPO} --comments
           and any failing checks: gh pr checks ${NUMBER} --repo ${REPO}, then gh run view <run-id> --repo ${REPO} --log-failed
-          Fix every CI failure and every finding, blockers and majors first. Fix minor findings too unless one is clearly out of this PR's scope; for any you skip, say why in your reply." ;;
+          Fix every CI failure and every finding, blockers and majors first. Fix minor findings too unless one is clearly out of this PR's scope; for any you skip, say why in your reply.
+          Also do any earlier request from a human in the PR comments that no reply from Claude has addressed yet." ;;
             *)
               trigger="Triggering comment:
           ${TRIGGER_COMMENT}" ;;
@@ -146,6 +147,10 @@ jobs:
              change and the verification you ran, and includes \`Closes #${NUMBER}\`.
           9. Comment on the issue with a link to the PR.
           Never write the Claude trigger mention (at-sign + claude) in commits, PRs or comments.
+          This run is NON-INTERACTIVE: it ends the moment you stop, and anything not pushed is lost.
+          Run every command in the FOREGROUND and wait for it (give long ones a timeout of up to
+          10 minutes). Never start background commands, never wait for a notification, and never
+          end your turn until your work is committed and pushed.
 
           ${trigger}
           EOF
@@ -158,8 +163,12 @@ jobs:
 
           1. Read CLAUDE.md first and follow it strictly.
           2. Read the PR and its linked issue: \`gh pr view ${NUMBER} --comments\`, \`gh pr diff ${NUMBER}\`.
-          3. Make the smallest changes that address the points above, staying within the PR's scope.
-             If you disagree with a point, do not change code for it; explain why in your reply.
+          3. Make the smallest changes that address the points above.
+             - A request a HUMAN makes explicitly (in a comment or review on this PR) is in scope by
+               definition, even if it widens the PR: implement it. Push back only if it would break
+               CLAUDE.md rules or is unsafe, and then explain why in your reply.
+             - For automated review findings, stay within the PR's scope; if you disagree with one,
+               don't change code for it and explain why in your reply.
           4. Add or update tests for every behavior change.
           5. Run the verification commands from CLAUDE.md for every affected package;
              each must exit 0. If anything fails, fix it and re-run.
@@ -170,6 +179,10 @@ jobs:
              \`gh api repos/${REPO}/pulls/${NUMBER}/comments/<comment-id>/replies -f body=...\`
           Do not modify files under \`.github/workflows/\` and do not commit \`.env\` files or secrets.
           Never write the Claude trigger mention (at-sign + claude) in commits or comments.
+          This run is NON-INTERACTIVE: it ends the moment you stop, and anything not pushed is lost.
+          Run every command in the FOREGROUND and wait for it (give long ones a timeout of up to
+          10 minutes). Never start background commands, never wait for a notification, and never
+          end your turn until your work is committed and pushed.
           EOF
             fi
             echo "${delim}"
@@ -233,6 +246,9 @@ jobs:
 
       - id: claude
         uses: anthropics/claude-code-action@v1
+        env:
+          # Headless run: a backgrounded command outlives the session, which then ends before the push.
+          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1'
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           track_progress: ${{ github.event_name == 'issues' }}
@@ -244,7 +260,7 @@ jobs:
             --max-turns ${{ inputs.max_turns }}
             ${{ inputs.model != '' && format('--model {0}', inputs.model) || '' }}
             --permission-mode bypassPermissions
-            --disallowedTools "WebFetch,WebSearch"
+            --disallowedTools "WebFetch,WebSearch,Monitor"
             ${{ steps.restore.outputs.args }}
           prompt: ${{ steps.restore.outputs.prefix }}${{ steps.ctx.outputs.text }}
 
