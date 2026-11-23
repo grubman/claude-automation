@@ -13,7 +13,6 @@ validate the PR and give the human reviewer a short, honest bottom line.
 - Read `CLAUDE.md` (and any docs it points to) for this project's architecture and rules.
 - If `.claude-out/review-extra.md` exists, it lists this project's extra review checks.
   Apply them as part of check 3.
-- Ignore the `.claude-automation/` directory: it's the automation itself, not the PR.
 
 ## What to check (in this order)
 1. **Does it do what the linked issue asks?** Every acceptance criterion met; nothing

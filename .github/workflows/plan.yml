@@ -1,0 +1,182 @@
+name: Claude Epic Planner (reusable)
+
+# Label an issue `claude-epic` (or `claude-epic-auto` to skip the approval gate) →
+# Claude reads it + the code and proposes ordered, PR-sized sub-issues.
+# Reply `/approve` on the epic → sub-issues are created and the independent ones are
+# labeled `claude` (in parallel, capped) so the Auto-PR worker builds them.
+# Optional per-repo planning rules: .github/claude/plan-extra.md (read from the default branch).
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        type: string
+        default: claude-opus-5-5
+      max_parallel:
+        description: Max sub-issues of one epic being built at once.
+        type: number
+        default: 3
+      automation_ref:
+        type: string
+        default: v1
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+      AUTOMATION_PAT:
+        required: true
+
+jobs:
+  plan:
+    concurrency:
+      group: claude-plan-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    if: |
+      github.event_name == 'issues' &&
+      (github.event.label.name == 'claude-epic' || github.event.label.name == 'claude-epic-auto') &&
+      !contains(github.event.issue.labels.*.name, 'claude-hold')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+      actions: read   # download a paused session's artifact
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      EPIC: ${{ github.event.issue.number }}
+      NUMBER: ${{ github.event.issue.number }}
+      AUTHOR: ${{ github.event.issue.user.login }}
+      MAX_PARALLEL: ${{ inputs.max_parallel }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 50   # recent history helps the planner; no install — it only reads
+
+      - name: Load automation scripts
+        uses: actions/checkout@v5
+        with:
+          repository: grubman/claude-automation
+          ref: ${{ inputs.automation_ref }}
+          path: .claude-automation
+          persist-credentials: false
+      - run: mv .claude-automation "$RUNNER_TEMP/claude-automation" && echo "AUTOMATION=$RUNNER_TEMP/claude-automation" >> "$GITHUB_ENV"
+
+      - name: Clear stale waiting labels
+        run: gh issue edit "$EPIC" --repo "$REPO" --remove-label claude-needs-input --remove-label claude-plan-proposed || true
+
+      # ── Resume a run paused by the Claude usage limit (no-op otherwise) ──
+      - name: Find paused session
+        id: resume
+        env:
+          KIND: plan
+          PHASE: find
+        run: bash "$AUTOMATION/scripts/resume-prepare.sh"
+
+      - name: Download paused session
+        if: steps.resume.outputs.resume == '1'
+        continue-on-error: true   # artifact may have expired; the WIP ref still restores files
+        uses: actions/download-artifact@v5
+        with:
+          name: claude-session-${{ steps.resume.outputs.run }}
+          run-id: ${{ steps.resume.outputs.run }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/claude-restore
+
+      - name: Restore paused progress
+        id: restore
+        if: steps.resume.outputs.resume == '1'
+        env:
+          KIND: plan
+          PHASE: restore
+          RESTORE_DIR: ${{ runner.temp }}/claude-restore
+          RESUME_BRANCH: ${{ steps.resume.outputs.branch }}
+          RESUME_SESSION: ${{ steps.resume.outputs.session }}
+        run: bash "$AUTOMATION/scripts/resume-prepare.sh"
+
+      - name: Build prompt
+        id: prompt
+        run: |
+          delim="PROMPT_$(openssl rand -hex 8)"
+          {
+            echo "text<<${delim}"
+            cat "$AUTOMATION/prompts/plan.md"
+            if [ -f .github/claude/plan-extra.md ]; then
+              echo; echo "## Project-specific planning rules"; echo
+              cat .github/claude/plan-extra.md
+            fi
+            echo
+            echo "## This run"
+            echo "- Repository: ${REPO}"
+            echo "- Epic: #${EPIC} (author: ${AUTHOR})"
+            echo "${delim}"
+          } >> "$GITHUB_OUTPUT"
+
+      - id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: >-
+            --max-turns 40
+            --model ${{ inputs.model }}
+            --allowedTools "Read,Glob,Grep,Write,Bash(gh issue view:*),Bash(gh issue list:*),Bash(git log:*),Bash(git show:*),Bash(ls:*),Bash(mkdir:*)"
+            --disallowedTools "Edit,WebFetch,WebSearch"
+            ${{ steps.restore.outputs.args }}
+          prompt: ${{ steps.restore.outputs.prefix }}${{ steps.prompt.outputs.text }}
+
+      - name: Pause on usage limit
+        id: pause
+        if: ${{ !cancelled() }}
+        env:
+          DISPATCH_TOKEN: ${{ secrets.AUTOMATION_PAT }}
+          KIND: plan
+          TRIGGER: ${{ github.event.label.name }}
+          RUN_ID: ${{ github.run_id }}
+          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
+          PREV_ATTEMPT: ${{ steps.resume.outputs.attempt }}
+        run: bash "$AUTOMATION/scripts/pause.sh"
+
+      - name: Save paused session
+        if: ${{ !cancelled() && steps.pause.outputs.paused == '1' }}
+        uses: actions/upload-artifact@v5
+        with:
+          name: claude-session-${{ github.run_id }}
+          path: ${{ runner.temp }}/claude-pause/
+          retention-days: 30   # covers a weekly-limit pause
+          if-no-files-found: ignore
+
+      - name: Publish plan / questions
+        if: ${{ !cancelled() && steps.pause.outputs.paused != '1' && steps.pause.outputs.gave_up != '1' }}
+        env:
+          DISPATCH_TOKEN: ${{ secrets.AUTOMATION_PAT }}
+          AUTO: ${{ github.event.label.name == 'claude-epic-auto' && '1' || '0' }}
+        run: bash "$AUTOMATION/scripts/plan-result.sh" "$EPIC" .claude-out/plan.json
+
+  approve:
+    if: |
+      github.event_name == 'issue_comment' &&
+      !github.event.issue.pull_request &&
+      contains(github.event.issue.labels.*.name, 'claude-plan-proposed') &&
+      startsWith(github.event.comment.body, '/approve') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DISPATCH_TOKEN: ${{ secrets.AUTOMATION_PAT }}
+      REPO: ${{ github.repository }}
+      MAX_PARALLEL: ${{ inputs.max_parallel }}
+    steps:
+      - name: Load automation scripts
+        uses: actions/checkout@v5
+        with:
+          repository: grubman/claude-automation
+          ref: ${{ inputs.automation_ref }}
+          path: .claude-automation
+          persist-credentials: false
+      - run: bash .claude-automation/scripts/approve-plan.sh "${{ github.event.issue.number }}"

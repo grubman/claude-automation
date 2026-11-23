@@ -1,0 +1,31 @@
+# Copy to .github/workflows/claude.yml (keep this file name).
+name: Claude Auto-PR
+
+on:
+  issues:
+    types: [labeled]          # label-only; creating an issue with the label also fires `labeled`
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]        # "Request changes" on a claude/* PR → fix mode
+  pull_request:
+    types: [labeled]          # `claude-fix` (added by the reviewer or by you) → fix mode
+
+jobs:
+  claude:
+    uses: grubman/claude-automation/.github/workflows/worker.yml@v1
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    with:
+      node_version: '22.x'                      # ← '' to skip
+      cache_dependency_path: package-lock.json  # ← lockfile(s), newline-separated
+      setup_command: npm ci                     # ← '' to let Claude install per CLAUDE.md
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}

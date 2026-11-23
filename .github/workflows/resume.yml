@@ -1,0 +1,45 @@
+name: Claude Resume On Reply (reusable)
+
+# When Claude is waiting on a human (label `claude-needs-input` or `claude-plan-proposed`)
+# and the issue author or a collaborator replies, re-trigger the right flow so it
+# re-runs with the whole comment thread as context. No need to type the Claude mention.
+#   epic (claude-epic / claude-epic-auto) → planner re-runs
+#   anything else                         → Auto-PR worker re-runs (label `claude`)
+# `/approve` is handled by the planner; comments mentioning Claude already trigger the worker.
+
+on:
+  workflow_call:
+    secrets:
+      AUTOMATION_PAT:
+        required: true
+
+jobs:
+  resume:
+    if: |
+      github.event_name == 'issue_comment' &&
+      !github.event.issue.pull_request &&
+      github.event.comment.user.type != 'Bot' &&
+      (contains(github.event.issue.labels.*.name, 'claude-needs-input') ||
+       contains(github.event.issue.labels.*.name, 'claude-plan-proposed')) &&
+      !contains(github.event.issue.labels.*.name, 'claude-hold') &&
+      !startsWith(github.event.comment.body, '/approve') &&
+      !contains(github.event.comment.body, '@claude') &&
+      (github.event.comment.user.login == github.event.issue.user.login ||
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions: {}
+    env:
+      GH_TOKEN: ${{ secrets.AUTOMATION_PAT }}   # PAT: the re-added label must trigger a workflow
+      REPO: ${{ github.repository }}
+      N: ${{ github.event.issue.number }}
+      IS_AUTO_EPIC: ${{ contains(github.event.issue.labels.*.name, 'claude-epic-auto') }}
+      IS_EPIC: ${{ contains(github.event.issue.labels.*.name, 'claude-epic') || contains(github.event.issue.labels.*.name, 'claude-epic-auto') }}
+    steps:
+      - run: |
+          if [ "$IS_AUTO_EPIC" = "true" ]; then trigger=claude-epic-auto
+          elif [ "$IS_EPIC" = "true" ]; then trigger=claude-epic
+          else trigger=claude; fi
+          gh issue edit "$N" --repo "$REPO" --remove-label claude-needs-input --remove-label claude-plan-proposed --remove-label "$trigger"
+          gh issue edit "$N" --repo "$REPO" --add-label "$trigger"
+          echo "Re-triggered #$N via label $trigger"

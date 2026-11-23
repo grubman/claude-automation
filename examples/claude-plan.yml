@@ -1,0 +1,22 @@
+# Copy to .github/workflows/claude-plan.yml.
+name: Claude Epic Planner
+
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+
+jobs:
+  plan:
+    uses: grubman/claude-automation/.github/workflows/plan.yml@v1
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+      actions: read
+    with:
+      max_parallel: 3
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}

@@ -1,0 +1,407 @@
+name: Claude Auto-PR worker (reusable)
+
+# Issue labeled `claude` → Claude builds it on a new `claude/issue-<n>-<slug>` branch and opens a PR.
+# On a PR (comment with the Claude mention, "Request changes" review on a claude/* PR, or the
+# `claude-fix` label) → FIX MODE: pushes to the PR's existing branch.
+# The caller (examples/claude.yml) owns the triggers. Its file must be named claude.yml.
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: Claude model; empty = the action's default.
+        type: string
+        default: ''
+      max_turns:
+        type: number
+        default: 60
+      timeout_minutes:
+        type: number
+        default: 15
+      node_version:
+        description: Node version to install before Claude runs; empty = skip.
+        type: string
+        default: '22.x'
+      cache_dependency_path:
+        description: Lockfile path(s) for the npm cache (newline-separated); empty = no cache.
+        type: string
+        default: package-lock.json
+      setup_command:
+        description: Shell command run before Claude (e.g. "npm ci"); empty = none.
+        type: string
+        default: npm ci
+      automation_ref:
+        type: string
+        default: v1
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+      AUTOMATION_PAT:
+        required: false
+
+jobs:
+  claude:
+    concurrency:
+      group: claude-${{ github.event.issue.number || github.event.pull_request.number }}
+      cancel-in-progress: false   # a cancelled run can leave a half-pushed branch
+    if: |
+      !contains(github.event.issue.labels.*.name, 'claude-hold') &&
+      !contains(github.event.pull_request.labels.*.name, 'claude-hold') &&
+      (
+        (github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'claude') ||
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review' && github.event.review.state == 'changes_requested' &&
+          startsWith(github.event.pull_request.head.ref, 'claude/')) ||
+        (github.event_name == 'pull_request' && github.event.label.name == 'claude-fix' &&
+          github.event.pull_request.head.repo.full_name == github.repository)
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read   # download a paused session's artifact
+
+    env:
+      REPO: ${{ github.repository }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      EVENT_NAME: ${{ github.event_name }}
+      IS_PR_COMMENT: ${{ github.event.issue.pull_request && 'true' || 'false' }}
+      NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+      AUTHOR: ${{ github.event.issue.user.login || github.event.pull_request.user.login }}
+      LABEL: ${{ github.event.label.name }}
+      REVIEW_ID: ${{ github.event.review.id }}
+      TRIGGER_COMMENT: ${{ github.event.comment.body }}
+
+    steps:
+      # Decide issue mode (new branch + PR) vs PR fix mode (push to the existing PR branch),
+      # and assemble the prompt. Runs before checkout so fix mode checks out the PR head.
+      - name: Resolve mode and prompt
+        id: ctx
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mode=issue
+          if [ "$EVENT_NAME" != "issues" ] && { [ "$EVENT_NAME" != "issue_comment" ] || [ "$IS_PR_COMMENT" = "true" ]; }; then
+            mode="pr"
+          fi
+          ref=""
+          if [ "$mode" = "pr" ]; then
+            read -r ref cross < <(gh pr view "$NUMBER" --repo "$REPO" --json headRefName,isCrossRepository -q '"\(.headRefName) \(.isCrossRepository)"')
+            [ "$cross" = "false" ] || { echo "Fork PRs are not supported"; exit 1; }
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          if [ "$mode" = "pr" ]; then echo "kind=fix" >> "$GITHUB_OUTPUT"; else echo "kind=worker" >> "$GITHUB_OUTPUT"; fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          B="$DEFAULT_BRANCH"
+
+          case "$EVENT_NAME:$LABEL" in
+            pull_request_review:*)
+              trigger="A human submitted a review requesting changes (review id ${REVIEW_ID}).
+          Read it with: gh api repos/${REPO}/pulls/${NUMBER}/reviews/${REVIEW_ID}
+          and its inline comments: gh api repos/${REPO}/pulls/${NUMBER}/reviews/${REVIEW_ID}/comments
+          Address every point." ;;
+            pull_request:claude-fix)
+              trigger="The \`claude-fix\` label was added. Read the latest automated review comment on the PR
+          (the one containing '<!-- claude-review') with: gh pr view ${NUMBER} --repo ${REPO} --comments
+          and any failing checks: gh pr checks ${NUMBER} --repo ${REPO}, then gh run view <run-id> --repo ${REPO} --log-failed
+          Fix every CI failure and every finding, blockers and majors first. Fix minor findings too unless one is clearly out of this PR's scope; for any you skip, say why in your reply." ;;
+            *)
+              trigger="Triggering comment:
+          ${TRIGGER_COMMENT}" ;;
+          esac
+
+          delim="PROMPT_$(openssl rand -hex 8)"   # random: comment text can't end the block
+          {
+            echo "text<<${delim}"
+            if [ "$mode" = "issue" ]; then
+              cat <<EOF
+          You are working in the ${REPO} repository on issue #${NUMBER} (author: ${AUTHOR}).
+
+          1. Read CLAUDE.md first and follow it strictly, especially any section with rules
+             for the automated agent (GitHub Action).
+          2. Read the issue with \`gh issue view ${NUMBER} --comments\`. Later human comments
+             override the original body. If the body contains \`Parent: #<n>\`, also read that
+             epic for context, but implement ONLY this issue's scope.
+          3. If (and only if) a blocking ambiguity would change what you build: post ONE comment
+             on the issue that starts with "@${AUTHOR}", lists numbered questions with the
+             default you would pick for each, run \`gh issue edit ${NUMBER} --add-label claude-needs-input\`,
+             and stop without creating a branch. Otherwise choose the conventional default and
+             note the assumption in the PR body.
+          4. Create a new branch named \`claude/issue-${NUMBER}-<short-slug>\` from \`${B}\`.
+             Do not commit or push to \`${B}\`.
+          5. Implement the change with matching tests.
+          6. Run the verification commands from CLAUDE.md for every package you changed
+             and make sure each exits 0. If anything fails, fix it and re-run.
+          7. Do not modify files under \`.github/workflows/\` and do not commit \`.env\` files or secrets.
+          8. Right before the FIRST push of your new branch, bring in the latest default branch:
+             \`git fetch origin ${B} && git merge --no-edit origin/${B}\` (never rebase). GitHub rejects
+             a new branch whose workflow files differ from \`${B}\`, which happens when \`${B}\` changed
+             while you worked. If the merge conflicts, resolve it and re-run the verification.
+             Then push the branch and open a PR with \`gh pr create\` whose body summarizes the
+             change and the verification you ran, and includes \`Closes #${NUMBER}\`.
+          9. Comment on the issue with a link to the PR.
+          Never write the Claude trigger mention (at-sign + claude) in commits, PRs or comments.
+
+          ${trigger}
+          EOF
+            else
+              cat <<EOF
+          You are working in the ${REPO} repository on pull request #${NUMBER}.
+          Its branch \`${ref}\` is already checked out. This is FIX MODE.
+
+          ${trigger}
+
+          1. Read CLAUDE.md first and follow it strictly.
+          2. Read the PR and its linked issue: \`gh pr view ${NUMBER} --comments\`, \`gh pr diff ${NUMBER}\`.
+          3. Make the smallest changes that address the points above, staying within the PR's scope.
+             If you disagree with a point, do not change code for it; explain why in your reply.
+          4. Add or update tests for every behavior change.
+          5. Run the verification commands from CLAUDE.md for every affected package;
+             each must exit 0. If anything fails, fix it and re-run.
+          6. Commit and push to the SAME branch: \`git push origin HEAD:${ref}\`.
+             Never create a new branch or PR, never rebase, never force-push.
+          7. Comment on the PR with a short list: each point → what you changed (or why not).
+             For inline review comments, also reply in the thread:
+             \`gh api repos/${REPO}/pulls/${NUMBER}/comments/<comment-id>/replies -f body=...\`
+          Do not modify files under \`.github/workflows/\` and do not commit \`.env\` files or secrets.
+          Never write the Claude trigger mention (at-sign + claude) in commits or comments.
+          EOF
+            fi
+            echo "${delim}"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.ctx.outputs.ref }}
+
+      # Scripts live outside the repo checkout, so nothing can commit them.
+      - name: Load automation scripts
+        uses: actions/checkout@v5
+        with:
+          repository: grubman/claude-automation
+          ref: ${{ inputs.automation_ref }}
+          path: .claude-automation
+          persist-credentials: false
+      - run: mv .claude-automation "$RUNNER_TEMP/claude-automation" && echo "AUTOMATION=$RUNNER_TEMP/claude-automation" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v5
+        if: inputs.node_version != ''
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: ${{ inputs.cache_dependency_path != '' && 'npm' || '' }}
+          cache-dependency-path: ${{ inputs.cache_dependency_path }}
+      - name: Install dependencies
+        if: inputs.setup_command != ''
+        run: ${{ inputs.setup_command }}
+
+      # ── Resume a run paused by the Claude usage limit (no-op otherwise) ──
+      - name: Find paused session
+        id: resume
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIND: ${{ steps.ctx.outputs.kind }}
+          PHASE: find
+        run: bash "$AUTOMATION/scripts/resume-prepare.sh"
+
+      - name: Download paused session
+        if: steps.resume.outputs.resume == '1'
+        continue-on-error: true   # artifact may have expired; the WIP ref still restores files
+        uses: actions/download-artifact@v5
+        with:
+          name: claude-session-${{ steps.resume.outputs.run }}
+          run-id: ${{ steps.resume.outputs.run }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/claude-restore
+
+      - name: Restore paused progress
+        id: restore
+        if: steps.resume.outputs.resume == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIND: ${{ steps.ctx.outputs.kind }}
+          PHASE: restore
+          RESTORE_DIR: ${{ runner.temp }}/claude-restore
+          RESUME_BRANCH: ${{ steps.resume.outputs.branch }}
+          RESUME_SESSION: ${{ steps.resume.outputs.session }}
+        run: bash "$AUTOMATION/scripts/resume-prepare.sh"
+
+      - id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          track_progress: ${{ github.event_name == 'issues' }}
+          # PRs opened by the worker are authored by claude[bot], whose write access the action
+          # can't confirm, so by default it denies npm test/lint/build in fix mode. Fork PRs are
+          # already rejected in the "Resolve mode and prompt" step, so every PR here is same-repo.
+          restrict_untrusted_prs: false
+          claude_args: >-
+            --max-turns ${{ inputs.max_turns }}
+            ${{ inputs.model != '' && format('--model {0}', inputs.model) || '' }}
+            --permission-mode bypassPermissions
+            --disallowedTools "WebFetch,WebSearch"
+            ${{ steps.restore.outputs.args }}
+          prompt: ${{ steps.restore.outputs.prefix }}${{ steps.ctx.outputs.text }}
+
+      - name: Pause on usage limit
+        id: pause
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISPATCH_TOKEN: ${{ secrets.AUTOMATION_PAT }}
+          KIND: ${{ steps.ctx.outputs.kind }}
+          TRIGGER: ${{ steps.ctx.outputs.mode == 'pr' && 'claude-fix' || 'claude' }}
+          RUN_ID: ${{ github.run_id }}
+          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
+          PREV_ATTEMPT: ${{ steps.resume.outputs.attempt }}
+        run: bash "$AUTOMATION/scripts/pause.sh"
+
+      - name: Save paused session
+        if: ${{ !cancelled() && steps.pause.outputs.paused == '1' }}
+        uses: actions/upload-artifact@v5
+        with:
+          name: claude-session-${{ github.run_id }}
+          path: ${{ runner.temp }}/claude-pause/
+          retention-days: 30   # covers a weekly-limit pause
+          if-no-files-found: ignore
+
+      - name: Upload Claude execution log
+        if: ${{ !cancelled() && steps.claude.outputs.execution_file != '' }}
+        uses: actions/upload-artifact@v5
+        with:
+          name: claude-execution-${{ github.run_id }}
+          path: ${{ steps.claude.outputs.execution_file }}
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Ensure Branch Pushed & Pull Request Opened
+        id: fallback
+        if: ${{ !cancelled() && github.event_name == 'issues' && steps.pause.outputs.paused != '1' && steps.pause.outputs.gave_up != '1' }}
+        env:
+          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
+          GH_TOKEN: ${{ github.token }}
+          # PRs opened with GITHUB_TOKEN start no workflows: CI waits for manual approval and the
+          # review (workflow_run) never fires. Open them with the PAT instead.
+          PR_TOKEN: ${{ secrets.AUTOMATION_PAT || github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          N="$ISSUE_NUMBER"; B="$DEFAULT_BRANCH"
+          BRANCH_RE="^claude/issue-${N}(-|$)"
+
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+
+          # A failed run (not the usage limit — that pauses above) must not become a
+          # half-done PR. Leave any pushed branch for a human, flag the issue, stop.
+          if [ "$CLAUDE_OUTCOME" != "success" ]; then
+            if gh issue view "$N" --repo "$REPO" --json labels -q '.labels[].name' | grep -qx claude-needs-input; then exit 0; fi
+            gh issue comment "$N" --repo "$REPO" --body "The Claude run failed before finishing (${RUN_URL}). No PR was opened; any work already pushed is on a \`claude/issue-${N}*\` branch. Remove \`claude-failed\` and re-add \`claude\` to retry."
+            gh issue edit "$N" --repo "$REPO" --add-label claude-failed || true
+            exit 0
+          fi
+
+          git config user.name  >/dev/null || git config user.name  "github-actions[bot]"
+          git config user.email >/dev/null || git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Leftover work: uncommitted changes, or local commits on the issue branch that never
+          # reached the remote (e.g. Claude's own push was rejected).
+          current="$(git branch --show-current)"
+          unpushed=0
+          if echo "$current" | grep -Eq "$BRANCH_RE" && git rev-parse -q --verify "refs/remotes/origin/${current}" >/dev/null; then
+            [ "$(git rev-list --count "origin/${current}..HEAD")" -eq 0 ] || unpushed=1
+          else
+            # New issue branch, another branch name, or detached HEAD: any commit ahead of the default branch.
+            [ "$(git rev-list --count "origin/${B}..HEAD")" -eq 0 ] || unpushed=1
+          fi
+          if [ -n "$(git status --porcelain)" ] || [ "$unpushed" = 1 ]; then
+            if echo "$current" | grep -Eq "$BRANCH_RE"; then branch="$current"
+            else branch="claude/issue-${N}"; git checkout -B "$branch"; fi
+            git add -A -- . ':!.github/workflows' ':!**/.env*'
+            git diff --cached --quiet || git commit -m "chore: commit leftover changes (#${N})"
+            # Match the default branch's workflow files, or GitHub rejects the new branch (no workflows
+            # permission). Only for a NEW branch: on an existing one, merging would add workflow changes
+            # to the pushed diff and get it rejected; a plain push of the new commits is fine.
+            why="the push was rejected"; merged_main=0
+            if git rev-parse -q --verify "refs/remotes/origin/${branch}" >/dev/null; then
+              base="origin/${branch}"
+            else
+              base="origin/${B}"
+              if ! git fetch -q origin "$B"; then
+                why="fetching the latest \`${B}\` failed, so the push was rejected"
+              elif git merge -q --no-edit "origin/${B}"; then
+                merged_main=1
+              else
+                git merge --abort || true
+                why="merging the latest \`${B}\` conflicted, so the push was rejected"
+              fi
+            fi
+            if ! git push origin "HEAD:refs/heads/${branch}"; then
+              # Don't lose the work: save the unpushed commits as patches in a run artifact.
+              mkdir -p "$RUNNER_TEMP/stranded"
+              git format-patch -q "${base}..HEAD" -o "$RUNNER_TEMP/stranded" || true
+              echo "stranded=1" >> "$GITHUB_OUTPUT"
+              gh issue comment "$N" --repo "$REPO" --body "Claude finished, but ${why}, so no PR was opened. The commits are saved as patch files in artifact \`stranded-${{ github.run_id }}\` (14 days) on ${RUN_URL}; apply them with \`git am\`. To rebuild instead, remove \`claude-failed\` and re-add \`claude\`."
+              gh issue edit "$N" --repo "$REPO" --add-label claude-failed || true
+              exit 0
+            fi
+          fi
+
+          git fetch origin --prune
+          branch="$(git for-each-ref --sort=-committerdate --format='%(refname:lstrip=3)' refs/remotes/origin/claude/ \
+            | grep -E "$BRANCH_RE" | head -n1 || true)"
+          # Claude asked the author questions instead of building: that's expected, not a failure.
+          if gh issue view "$N" --repo "$REPO" --json labels -q '.labels[].name' | grep -qx claude-needs-input; then
+            echo "Waiting for input on #${N}"
+            exit 0
+          fi
+          if [ -z "$branch" ]; then
+            gh issue comment "$N" --repo "$REPO" --body "Claude run finished without a \`claude/issue-${N}\` branch. See ${RUN_URL}"
+            gh issue edit "$N" --repo "$REPO" --add-label claude-failed || true
+            exit 0
+          fi
+          if [ "$(git rev-list --count "origin/${B}..origin/${branch}")" -eq 0 ]; then
+            gh issue comment "$N" --repo "$REPO" --body "Branch \`${branch}\` has no commits ahead of \`${B}\`; no PR opened. See ${RUN_URL}"
+            gh issue edit "$N" --repo "$REPO" --add-label claude-failed || true
+            exit 0
+          fi
+          merge_note=""
+          [ "${merged_main:-0}" = 1 ] && merge_note="
+
+          The fallback merged the latest \`${B}\` into this branch before pushing, so CI on this PR is the first check of the merged tree."
+          existing="$(gh pr list --repo "$REPO" --head "$branch" --state all --json url -q '.[0].url')"
+          if [ -z "$existing" ]; then
+            pr_url="$(GH_TOKEN="$PR_TOKEN" gh pr create --repo "$REPO" --base "$B" --head "$branch" --title "$ISSUE_TITLE" \
+              --body "$(printf 'Automated PR for #%s, opened by the workflow fallback.%s\n\nCloses #%s\n\nRun: %s' "$N" "$merge_note" "$N" "$RUN_URL")")"
+            gh issue comment "$N" --repo "$REPO" --body "Opened PR: ${pr_url}"
+          fi
+
+      - name: Save unpushed commits
+        if: ${{ !cancelled() && steps.fallback.outputs.stranded == '1' }}
+        uses: actions/upload-artifact@v5
+        with:
+          name: stranded-${{ github.run_id }}
+          path: ${{ runner.temp }}/stranded/
+          retention-days: 14
+
+      - name: Clean up WIP ref
+        if: ${{ steps.claude.outcome == 'success' && steps.resume.outputs.resume == '1' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIND: ${{ steps.ctx.outputs.kind }}
+        run: |
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          git push -q origin --delete "refs/claude-wip/${KIND}-${NUMBER}" || true
+
+      # Let the reviewer add `claude-fix` again for the next round.
+      - name: Clear claude-fix label
+        if: ${{ always() && github.event_name == 'pull_request' && github.event.label.name == 'claude-fix' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr edit "$NUMBER" --repo "$REPO" --remove-label claude-fix || true

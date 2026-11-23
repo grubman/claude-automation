@@ -1,0 +1,16 @@
+# Copy to .github/workflows/claude-unpause.yml.
+name: Claude Unpause
+
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+
+jobs:
+  unpause:
+    # Gate here: while nothing is paused the hourly schedule costs 0 Actions minutes.
+    if: vars.CLAUDE_PAUSED == '1' || github.event_name == 'workflow_dispatch'
+    uses: grubman/claude-automation/.github/workflows/unpause.yml@v1
+    permissions: {}
+    secrets:
+      AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}

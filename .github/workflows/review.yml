@@ -75,7 +75,6 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      AUTOMATION: .claude-automation
 
     steps:
       - name: Resolve PR and decide whether to review
@@ -173,6 +172,7 @@ jobs:
           ref: ${{ inputs.automation_ref }}
           path: .claude-automation
           persist-credentials: false
+      - run: mv .claude-automation "$RUNNER_TEMP/claude-automation" && echo "AUTOMATION=$RUNNER_TEMP/claude-automation" >> "$GITHUB_ENV"
 
       - name: Collect PR facts
         if: steps.ctx.outputs.skip == '0'
@@ -183,7 +183,6 @@ jobs:
           CI_RUN_ID: ${{ steps.ctx.outputs.ci_run }}
           SRC_REGEX: ${{ inputs.src_regex }}
         run: |
-          echo "/.claude-automation/" >> .git/info/exclude
           mkdir -p .claude-out
           # Project checks and rules come from the base branch: a PR can't change what it's judged by.
           checks="$RUNNER_TEMP/project-checks.sh"

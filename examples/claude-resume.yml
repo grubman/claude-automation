@@ -1,0 +1,13 @@
+# Copy to .github/workflows/claude-resume.yml.
+name: Claude Resume On Reply
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  resume:
+    uses: grubman/claude-automation/.github/workflows/resume.yml@v1
+    permissions: {}
+    secrets:
+      AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}

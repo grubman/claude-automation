@@ -1,0 +1,64 @@
+name: Claude Epic Dispatcher (reusable)
+
+# When a planned sub-issue closes (normally because its PR merged with `Closes #n`),
+# label the next ready sub-issues `claude`. Also runs on demand for an epic, and when a
+# stuck sub-issue is unblocked (claude-failed / claude-hold / claude-needs-input removed).
+
+on:
+  workflow_call:
+    inputs:
+      max_parallel:
+        type: number
+        default: 3
+      automation_ref:
+        type: string
+        default: v1
+    secrets:
+      AUTOMATION_PAT:
+        required: true
+
+jobs:
+  resolve:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (contains(github.event.issue.body, '<!-- claude-plan parent=') &&
+       (github.event.action == 'closed' ||
+        contains(fromJSON('["claude-failed","claude-hold","claude-needs-input"]'), github.event.label.name)))
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    outputs:
+      epic: ${{ steps.epic.outputs.number }}
+    steps:
+      - id: epic
+        env:
+          INPUT_EPIC: ${{ github.event.inputs.epic }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          if [ -n "$INPUT_EPIC" ]; then n="$INPUT_EPIC"
+          else n="$(printf '%s' "$ISSUE_BODY" | grep -o '<!-- claude-plan parent=[0-9]*' | head -n1 | grep -o '[0-9]*$')"; fi
+          [[ "$n" =~ ^[0-9]+$ ]] || { echo "no epic number"; exit 1; }
+          echo "number=$n" >> "$GITHUB_OUTPUT"
+
+  dispatch:
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    # One dispatcher per epic at a time, so two PRs merging together can't over-dispatch.
+    concurrency:
+      group: claude-dispatch-${{ needs.resolve.outputs.epic }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.AUTOMATION_PAT }}   # PAT: labels added with GITHUB_TOKEN don't trigger the worker
+      REPO: ${{ github.repository }}
+      MAX_PARALLEL: ${{ inputs.max_parallel }}
+    steps:
+      - name: Load automation scripts
+        uses: actions/checkout@v5
+        with:
+          repository: grubman/claude-automation
+          ref: ${{ inputs.automation_ref }}
+          path: .claude-automation
+          persist-credentials: false
+      - run: bash .claude-automation/scripts/dispatch-ready.sh "${{ needs.resolve.outputs.epic }}"

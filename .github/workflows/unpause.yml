@@ -1,0 +1,38 @@
+name: Claude Unpause (reusable)
+
+# Re-triggers runs that pause.sh paused on the Claude usage limit, once the limit has reset.
+# The CALLER gates its job on repo variable CLAUDE_PAUSED == '1' (set by pause.sh, cleared
+# by unpause.sh), so while nothing is paused the hourly schedule costs 0 Actions minutes.
+# Reviews are restarted with `gh workflow run claude-review.yml`, so the review caller must
+# use that file name.
+
+on:
+  workflow_call:
+    inputs:
+      automation_ref:
+        type: string
+        default: v1
+    secrets:
+      AUTOMATION_PAT:
+        required: true
+
+jobs:
+  unpause:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    concurrency:
+      group: claude-unpause
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.AUTOMATION_PAT }}   # PAT: re-added labels must trigger workflows
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Load automation scripts
+        uses: actions/checkout@v5
+        with:
+          repository: grubman/claude-automation
+          ref: ${{ inputs.automation_ref }}
+          path: .claude-automation
+          persist-credentials: false
+      - run: bash .claude-automation/scripts/unpause.sh

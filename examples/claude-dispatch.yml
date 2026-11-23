@@ -1,0 +1,20 @@
+# Copy to .github/workflows/claude-dispatch.yml.
+name: Claude Epic Dispatcher
+
+on:
+  issues:
+    types: [closed, unlabeled]
+  workflow_dispatch:
+    inputs:
+      epic:
+        description: Epic issue number
+        required: true
+
+jobs:
+  dispatch:
+    uses: grubman/claude-automation/.github/workflows/dispatch.yml@v1
+    permissions: {}
+    with:
+      max_parallel: 3   # ← keep equal to claude-plan.yml
+    secrets:
+      AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}
