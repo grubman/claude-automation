@@ -45,6 +45,13 @@ on:
         description: Repo dir with extra/override .kql files.
         type: string
         default: .github/claude/monitor-queries
+      deploy_workflows:
+        description: >-
+          Space-separated deploy workflow file names (e.g. "deploy-backend.yml deploy-frontend.yml").
+          Anomalies of a recently closed monitoring issue that were last seen before the fix's deploy
+          finished are skipped as leftovers instead of re-filed. Empty = use the issue's close time.
+        type: string
+        default: ''
       max_turns:
         type: number
         default: 40
@@ -148,9 +155,11 @@ jobs:
           bash "$AUTOMATION/scripts/monitor-sweep.sh"
           jq . "$OUT/anomalies.json"
 
-      - name: Dedupe against open monitoring issues
+      - name: Dedupe against open and recently fixed monitoring issues
         id: dedupe
         if: steps.cfg.outputs.ok == '1' && steps.sweep.outputs.count != '0'
+        env:
+          DEPLOY_WORKFLOWS: ${{ inputs.deploy_workflows }}
         run: bash "$AUTOMATION/scripts/monitor-dedupe.sh"
 
       - name: Build prompt

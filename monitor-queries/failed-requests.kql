@@ -2,6 +2,7 @@
 requests
 | where timestamp > ago({{LOOKBACK}})
 | summarize total = count(), failed = countif(toint(resultCode) >= 500),
+            lastSeen = maxif(timestamp, toint(resultCode) >= 500),
             resultCodes = make_set_if(resultCode, toint(resultCode) >= 500, 5),
             samples = make_set_if(operation_Id, toint(resultCode) >= 500, 3)
   by operation_Name

@@ -67,6 +67,16 @@ suppression **expires after 14 days** (undated markers count as expired), so a l
 regression on a once-noisy signal is investigated again. Close that issue to un-suppress
 everything.
 
+Fixed issues don't come back as false alarms. When a `monitoring` issue is closed (normally by a
+merged `Closes #n` PR), its fingerprints keep being checked for 7 days:
+- **Last seen before the fix went live:** the anomaly is a leftover and is skipped. "Went live"
+  means the first successful push deploy, after the close, of each workflow in `deploy_workflows`.
+- **Seen after the fix went live:** a new issue is filed that names the closed one as a regression.
+
+While that deploy is still running, the fix isn't live yet, so the anomaly is skipped too. Without
+`deploy_workflows`, the close time is used. Queries should return a `lastSeen` column for this;
+rows without one, like the synthetic checks, are always treated as current.
+
 ## Versioning
 Callers pin a tag (`@v1`) and each workflow loads its scripts from the same tag
 (`automation_ref`, default `v1`). Changes land on `main`; move the tag when they're ready.

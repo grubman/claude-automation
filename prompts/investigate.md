@@ -11,6 +11,9 @@ dimensions that matter are in the **Project context** section below (when presen
   and `data` (counts, sample `operation_Id`s, result codes, p95, ...). The KQL behind each
   `query` name is in `.claude-out/monitor-queries/<query>.kql`. `synthetic` /
   `synthetic-slow` are HTTP checks against the health endpoint or the frontend.
+  An anomaly with `regressionOf: <n>` matches issue #n, which was closed (normally by a fix PR)
+  and whose fix has been deployed, yet it occurred AFTER that deploy: the fix didn't work or it
+  regressed. Say so in the incident, link #n, and check what the fix changed.
   An anomaly with `suppressionExpired: true` was judged noise before; that suppression has
   expired, so decide afresh whether it is still noise.
 - App Insights app id and lookback are given at the end. Drill in with

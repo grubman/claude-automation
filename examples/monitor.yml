@@ -40,6 +40,7 @@ jobs:
       api_base_url: ${{ vars.API_BASE_URL }}
       health_path: ${{ vars.HEALTH_PATH || '/health' }}   # ← e.g. /api/public/health
       frontend_url: ${{ vars.FRONTEND_URL }}
+      deploy_workflows: deploy-backend.yml deploy-frontend.yml   # ← your deploy workflow FILE names
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       AZURE_MONITOR_CREDENTIALS: ${{ secrets.AZURE_MONITOR_CREDENTIALS }}

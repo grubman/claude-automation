@@ -3,7 +3,7 @@
 traces
 | where timestamp > ago({{LOOKBACK}})
 | where severityLevel >= 3
-| summarize occurrences = count(), severity = max(severityLevel),
+| summarize occurrences = count(), lastSeen = max(timestamp), severity = max(severityLevel),
             module = take_any(tostring(customDimensions.module)),
             samples = make_set(operation_Id, 3)
   by message = substring(message, 0, 300)
