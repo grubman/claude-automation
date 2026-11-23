@@ -1,0 +1,252 @@
+name: Claude PR Review (reusable)
+
+# Validates + reviews every non-draft PR and posts ONE sticky "Bottom line" comment.
+# Called from a thin workflow in each repo (see examples/claude-review.yml). The caller owns
+# the triggers; this workflow decides whether to review, collects facts, runs Claude
+# read-only, and renders the result.
+# - After CI: waits until every workflow in `ci_workflows` finished for the head commit,
+#   then reviews once with the combined verdict (never re-runs the test suites).
+# - PRs that no CI workflow covers are reviewed on the pull_request event directly.
+# - `/review` comment (collaborators) or workflow_dispatch forces a re-review.
+# - claude/* PRs that aren't ready get up to `max_fix_rounds` auto-fix rounds (adds `claude-fix`).
+#
+# Per-repo, optional, read from the PR's BASE branch:
+#   .github/claude/checks.sh        extra deterministic flags (see scripts/pr-facts.sh)
+#   .github/claude/review-extra.md  extra review rules for the prompt
+
+on:
+  workflow_call:
+    inputs:
+      ci_workflows:
+        description: Space-separated workflow file names that test PRs (e.g. "ci.yml e2e.yml"). Empty = no CI.
+        type: string
+        default: ''
+      ci_paths_regex:
+        description: ERE over changed paths; a match means CI runs for the PR, so the review waits for it.
+        type: string
+        default: ''
+      src_regex:
+        description: ERE for source paths (for the "source changed but no tests" flag).
+        type: string
+        default: ''
+      model:
+        type: string
+        default: claude-opus-5-5
+      auto_fix:
+        description: Let the review start auto-fix rounds on claude/* PRs (needs the worker workflow + AUTOMATION_PAT).
+        type: boolean
+        default: true
+      max_fix_rounds:
+        type: number
+        default: 2
+      automation_ref:
+        description: Ref of grubman/claude-automation to load scripts/prompts from. Keep equal to the @ref in `uses:`.
+        type: string
+        default: v1
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+      AUTOMATION_PAT:
+        required: false
+
+jobs:
+  review:
+    # Ordinary PR comments (anything but a collaborator's `/review`) get their own group: they only start a job that
+    # skips itself, and sharing the PR's group would cancel a review that's in progress.
+    concurrency:
+      group: claude-review-${{ (github.event_name == 'issue_comment' && !(startsWith(github.event.comment.body, '/review') && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))) && format('noop-{0}', github.run_id) || (github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number || github.event.inputs.pr || github.run_id) }}
+      cancel-in-progress: true
+    if: |
+      (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request' &&
+        github.event.workflow_run.conclusion != 'cancelled' && github.event.workflow_run.conclusion != 'skipped') ||
+      (github.event_name == 'pull_request' && !github.event.pull_request.draft) ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+        startsWith(github.event.comment.body, '/review') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      AUTOMATION: .claude-automation
+
+    steps:
+      - name: Resolve PR and decide whether to review
+        id: ctx
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          WR_PR: ${{ github.event.workflow_run.pull_requests[0].number }}
+          WR_SHA: ${{ github.event.workflow_run.head_sha }}
+          EV_PR: ${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr }}
+          CI_WORKFLOWS: ${{ inputs.ci_workflows }}
+          CI_PATHS: ${{ inputs.ci_paths_regex }}
+        run: |
+          set -euo pipefail
+          # ci_status <sha> → "<conclusion> <run id>" combined over CI_WORKFLOWS:
+          # pending if any run is unfinished, else the first failure, else cancelled, else success; none if no runs.
+          ci_status() {
+            local pending="" failed="" cancelled="" ok="" r id st co wf
+            for wf in $CI_WORKFLOWS; do
+              r="$(gh run list --repo "$REPO" --workflow "$wf" --commit "$1" --event pull_request \
+                     --json databaseId,status,conclusion -q '.[0] // empty' 2>/dev/null || true)"
+              [ -n "$r" ] || continue
+              id="$(jq -r .databaseId <<<"$r")"; st="$(jq -r .status <<<"$r")"; co="$(jq -r .conclusion <<<"$r")"
+              if [ "$st" != completed ]; then pending="${pending:-$id}"; continue; fi
+              case "$co" in
+                success|skipped|neutral) ok="${ok:-$id}" ;;
+                cancelled) cancelled="${cancelled:-$id}" ;;
+                *) [ -n "$failed" ] || failed="$co $id" ;;
+              esac
+            done
+            if   [ -n "$pending" ];   then echo "pending $pending"
+            elif [ -n "$failed" ];    then echo "$failed"
+            elif [ -n "$cancelled" ]; then echo "cancelled $cancelled"
+            elif [ -n "$ok" ];        then echo "success $ok"
+            else echo "none"; fi
+          }
+
+          force=0; ci_conclusion=none; ci_run=""
+          case "$EVENT_NAME" in
+            workflow_run)
+              pr="$WR_PR"
+              [ -n "$pr" ] || pr="$(gh pr list --repo "$REPO" --state open --search "$WR_SHA" --json number -q '.[0].number')" ;;
+            pull_request)
+              pr="$EV_PR"
+              # PRs that also trigger CI are reviewed after CI instead.
+              if [ -n "$CI_PATHS" ] && gh pr diff "$pr" --repo "$REPO" --name-only | grep -Eq "$CI_PATHS"; then
+                echo "CI will run for this PR; review deferred to workflow_run."; echo "skip=1" >> "$GITHUB_OUTPUT"; exit 0
+              fi ;;
+            *)
+              pr="$EV_PR"; force=1 ;;
+          esac
+          [ -n "${pr:-}" ] || { echo "No PR found"; echo "skip=1" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          info="$(gh pr view "$pr" --repo "$REPO" --json headRefOid,headRefName,baseRefName,isDraft,state,isCrossRepository)"
+          sha="$(jq -r .headRefOid <<<"$info")"
+          skip=0
+          [ "$(jq -r .state <<<"$info")" = "OPEN" ] || skip=1
+          [ "$(jq -r .isDraft <<<"$info")" = "false" ] || skip=1
+          [ "$(jq -r .isCrossRepository <<<"$info")" = "false" ] || skip=1   # never run with secrets on fork code
+          # A paused fix run will resume and push; review that result instead.
+          ! gh pr view "$pr" --repo "$REPO" --json labels -q '.labels[].name' | grep -qx claude-paused || skip=1
+          # CI finished for an older commit → a newer CI run will trigger us again.
+          [ "$EVENT_NAME" != "workflow_run" ] || [ "$WR_SHA" = "$sha" ] || skip=1
+
+          if [ "$skip" = 0 ] && { [ "$EVENT_NAME" = workflow_run ] || [ "$force" = 1 ]; }; then
+            read -r ci_conclusion ci_run <<<"$(ci_status "$sha")" || true
+            if [ "$EVENT_NAME" = workflow_run ]; then
+              case "$ci_conclusion" in
+                pending)   echo "Another CI workflow is still running for ${sha}; its completion will trigger the review."; skip=1 ;;
+                cancelled) echo "A CI run was cancelled for ${sha}; not reviewing."; skip=1 ;;
+              esac
+            fi
+          fi
+          if [ "$force" = 0 ] && [ "$skip" = 0 ] && \
+             gh api --paginate "repos/$REPO/issues/$pr/comments" -q '.[].body' | grep -q "<!-- claude-review sha=${sha} "; then
+            echo "Commit ${sha} already reviewed"; skip=1
+          fi
+
+          {
+            echo "skip=$skip"; echo "pr=$pr"; echo "sha=$sha"
+            echo "ref=$(jq -r .headRefName <<<"$info")"; echo "base=$(jq -r .baseRefName <<<"$info")"
+            echo "ci_conclusion=${ci_conclusion:-none}"; echo "ci_run=${ci_run:-}"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v5
+        if: steps.ctx.outputs.skip == '0'
+        with:
+          ref: ${{ steps.ctx.outputs.sha }}
+          fetch-depth: 0   # needs origin/<base> for the diff; no npm ci — CI already tested
+
+      - name: Load automation scripts
+        if: steps.ctx.outputs.skip == '0'
+        uses: actions/checkout@v5
+        with:
+          repository: grubman/claude-automation
+          ref: ${{ inputs.automation_ref }}
+          path: .claude-automation
+          persist-credentials: false
+
+      - name: Collect PR facts
+        if: steps.ctx.outputs.skip == '0'
+        env:
+          PR: ${{ steps.ctx.outputs.pr }}
+          BASE: ${{ steps.ctx.outputs.base }}
+          CI_CONCLUSION: ${{ steps.ctx.outputs.ci_conclusion }}
+          CI_RUN_ID: ${{ steps.ctx.outputs.ci_run }}
+          SRC_REGEX: ${{ inputs.src_regex }}
+        run: |
+          echo "/.claude-automation/" >> .git/info/exclude
+          mkdir -p .claude-out
+          # Project checks and rules come from the base branch: a PR can't change what it's judged by.
+          checks="$RUNNER_TEMP/project-checks.sh"
+          git show "origin/${BASE}:.github/claude/checks.sh" > "$checks" 2>/dev/null || rm -f "$checks"
+          git show "origin/${BASE}:.github/claude/review-extra.md" > .claude-out/review-extra.md 2>/dev/null || rm -f .claude-out/review-extra.md
+          [ -n "$SRC_REGEX" ] || unset SRC_REGEX
+          PROJECT_CHECKS="$checks" bash "$AUTOMATION/scripts/pr-facts.sh" > .claude-out/facts.md
+          cat .claude-out/facts.md
+
+      - name: Build prompt
+        if: steps.ctx.outputs.skip == '0'
+        id: prompt
+        run: |
+          delim="PROMPT_$(openssl rand -hex 8)"
+          {
+            echo "text<<${delim}"
+            cat "$AUTOMATION/prompts/review.md"
+            echo
+            echo "## This run"
+            echo "- Repository: ${REPO}"
+            echo "- PR: #${{ steps.ctx.outputs.pr }} (base \`${{ steps.ctx.outputs.base }}\`, head \`${{ steps.ctx.outputs.sha }}\`)"
+            echo "- Facts file: .claude-out/facts.md"
+            [ -f .claude-out/review-extra.md ] && echo "- Project review rules: .claude-out/review-extra.md"
+            echo "${delim}"
+          } >> "$GITHUB_OUTPUT"
+
+      - id: claude
+        if: steps.ctx.outputs.skip == '0'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The reviewer never writes to GitHub itself (a later step posts), so the job token is
+          # enough and the action skips its GitHub App token exchange.
+          github_token: ${{ github.token }}
+          allowed_bots: claude   # CI on PRs the worker opened runs as claude[bot] → workflow_run actor is the bot
+          claude_args: >-
+            --max-turns 30
+            --model ${{ inputs.model }}
+            --allowedTools "Read,Glob,Grep,Write,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh issue view:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(mkdir:*)"
+            --disallowedTools "Edit,WebFetch,WebSearch"
+          prompt: ${{ steps.prompt.outputs.text }}
+
+      - name: Pause on usage limit
+        id: pause
+        if: ${{ !cancelled() && steps.ctx.outputs.skip == '0' }}
+        env:
+          DISPATCH_TOKEN: ${{ secrets.AUTOMATION_PAT }}
+          KIND: review
+          NUMBER: ${{ steps.ctx.outputs.pr }}
+          TRIGGER: review
+          RUN_ID: ${{ github.run_id }}
+          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
+        run: bash "$AUTOMATION/scripts/pause.sh"
+
+      - name: Post bottom line
+        if: ${{ !cancelled() && steps.ctx.outputs.skip == '0' && steps.pause.outputs.paused != '1' }}
+        env:
+          DISPATCH_TOKEN: ${{ secrets.AUTOMATION_PAT }}
+          PR: ${{ steps.ctx.outputs.pr }}
+          HEAD_SHA: ${{ steps.ctx.outputs.sha }}
+          HEAD_REF: ${{ steps.ctx.outputs.ref }}
+          CI_CONCLUSION: ${{ steps.ctx.outputs.ci_conclusion }}
+          AUTO_FIX: ${{ inputs.auto_fix && (secrets.AUTOMATION_PAT != '') && '1' || '0' }}
+          AUTO_FIX_MINOR: ${{ inputs.auto_fix && '1' || '0' }}
+          MAX_FIX_ROUNDS: ${{ inputs.max_fix_rounds }}
+        run: bash "$AUTOMATION/scripts/post-review.sh" .claude-out/review.json
