@@ -1,0 +1,12 @@
+// p95 latency regressions per operation vs the previous 7 days.
+let baseline = requests
+  | where timestamp between (ago(7d) .. ago({{LOOKBACK}}))
+  | summarize base_p95 = percentile(duration, 95), base_n = count() by operation_Name;
+requests
+| where timestamp > ago({{LOOKBACK}})
+| summarize p95 = percentile(duration, 95), n = count(), samples = make_set(operation_Id, 3) by operation_Name
+| where n >= 10
+| join kind=leftouter baseline on operation_Name
+| where p95 > 1500 and (isnull(base_p95) or p95 > 2 * base_p95)
+| project operation_Name, n, p95, base_p95, base_n, samples, key = operation_Name
+| order by p95 desc

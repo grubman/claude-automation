@@ -13,6 +13,7 @@ prompts live here.
 | `dispatch.yml` | `claude-dispatch.yml` | When a sub-issue closes, labels the next ready ones `claude` (capped in parallel); closes the epic when all are done. |
 | `resume.yml` | `claude-resume.yml` | When Claude asked a question (`claude-needs-input` / `claude-plan-proposed`), your reply re-runs the right flow. |
 | `unpause.yml` | `claude-unpause.yml` | Runs paused by the Claude usage limit resume automatically after the reset. |
+| `monitor.yml` | `monitor.yml` | Live-site monitor (every 6h, after each deploy, manual): health check + App Insights KQL sweep with no LLM; Claude investigates only new anomalies and files `monitoring` issues. Never auto-fixes. |
 
 Safety nets: `claude-hold` stops anything; agents never push to the default branch, edit
 `.github/workflows/`, or commit secrets; reviews never run on fork PRs.
@@ -39,6 +40,32 @@ Safety nets: `claude-hold` stops anything; agents never push to the default bran
      be serialized, design-guide requirements).
    The reviewer reads `checks.sh` and `review-extra.md` from the PR's base branch, so a PR
    can't change what it's judged by.
+
+## Live-site monitor setup
+Copy `examples/monitor.yml`. Until the secret and `APPINSIGHTS_APP_ID` exist, it only logs a notice.
+1. Create a read-only service principal scoped to the App Insights resource only:
+   ```bash
+   az ad sp create-for-rbac --name <app>-monitor-reader --role "Monitoring Reader" \
+     --scopes <app-insights-resource-id> --json-auth --subscription <id>
+   ```
+   Its JSON goes in secret `AZURE_MONITOR_CREDENTIALS`. Because it has no subscription-level
+   role, the workflow logs in with `allow-no-subscriptions: true`.
+2. Repo variables: `APPINSIGHTS_APP_ID` (`az monitor app-insights component show ... --query appId`),
+   `API_BASE_URL`, `HEALTH_PATH` (default `/health`), `FRONTEND_URL`.
+3. Labels `monitoring` and `monitoring-suppressed` (created by `setup-labels.sh` or by hand).
+4. Optional project files:
+   - `.github/claude/investigate-extra.md`: what the app is, its Azure resources, and the
+     customDimensions worth breaking down by. Appended to `prompts/investigate.md`.
+   - `.github/claude/monitor-queries/*.kql` (`queries_dir` input): extra queries. A file with
+     the same name as one in `monitor-queries/` replaces it (e.g. to exclude long-lived SSE
+     requests from `slow-requests.kql`). Queries use `{{LOOKBACK}}` and must return a `key` column.
+
+How it dedupes: each anomaly's fingerprint (`sha1(query|key)`) is stored as a marker in an
+open `monitoring` issue. Tracked anomalies get a "still occurring" comment at most every 20h.
+Noise goes into one **"Monitoring: suppressed signals"** issue with a dated marker; a
+suppression **expires after 14 days** (undated markers count as expired), so a later
+regression on a once-noisy signal is investigated again. Close that issue to un-suppress
+everything.
 
 ## Versioning
 Callers pin a tag (`@v1`) and each workflow loads its scripts from the same tag

@@ -1,0 +1,12 @@
+// Error/fatal log traces (severityLevel >= 3), grouped by message.
+// `module` is a sample of customDimensions.module when the app logs one (empty otherwise).
+traces
+| where timestamp > ago({{LOOKBACK}})
+| where severityLevel >= 3
+| summarize occurrences = count(), severity = max(severityLevel),
+            module = take_any(tostring(customDimensions.module)),
+            samples = make_set(operation_Id, 3)
+  by message = substring(message, 0, 300)
+| where occurrences >= 3
+| extend key = message
+| order by occurrences desc

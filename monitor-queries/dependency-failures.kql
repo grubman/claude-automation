@@ -1,0 +1,9 @@
+// Failing outbound calls (SQL, auth provider, third-party APIs, ...), grouped by target.
+dependencies
+| where timestamp > ago({{LOOKBACK}})
+| where success == false
+| summarize failures = count(), resultCodes = make_set(resultCode, 5), samples = make_set(operation_Id, 3)
+  by type, target, name
+| where failures >= 3
+| extend key = strcat(type, "|", target, "|", name)
+| order by failures desc

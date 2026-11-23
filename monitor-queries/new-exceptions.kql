@@ -1,0 +1,14 @@
+// Exceptions that are new vs the previous 7 days, or recurring at volume.
+let baseline = exceptions
+  | where timestamp between (ago(7d) .. ago({{LOOKBACK}}))
+  | distinct problemId;
+exceptions
+| where timestamp > ago({{LOOKBACK}})
+| summarize occurrences = count(), firstSeen = min(timestamp), lastSeen = max(timestamp),
+            message = take_any(outerMessage), operation = take_any(operation_Name),
+            samples = make_set(operation_Id, 3)
+  by problemId, type
+| extend isNew = problemId !in (baseline)
+| where isNew or occurrences >= 10
+| extend key = problemId
+| order by occurrences desc

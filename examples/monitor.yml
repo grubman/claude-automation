@@ -1,0 +1,45 @@
+# Copy to .github/workflows/monitor.yml in your repo and adjust the marked lines.
+# Setup (service principal, secret, variables): README → "Live-site monitor setup".
+name: Live Site Monitor
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'               # every 6h, off the hour (GitHub delays :00 crons)
+  workflow_run:
+    workflows: ['Deploy Backend', 'Deploy Frontend']   # ← names of your deploy workflows
+    types: [completed]                   # post-deploy smoke + startup-error check
+  workflow_dispatch:
+    inputs:
+      lookback:
+        description: Window to inspect (e.g. 30m, 6h, 1d)
+        default: 6h
+      dry_run:
+        description: Print the issues/comments instead of creating them
+        type: boolean
+        default: false
+
+jobs:
+  monitor:
+    # Only after a successful deploy from a push to main: deploy workflows that also run
+    # tests on pull_request must not trigger the monitor (skipped jobs cost 0 minutes).
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
+    uses: grubman/claude-automation/.github/workflows/monitor.yml@v1
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+      id-token: write
+    with:
+      lookback: ${{ inputs.lookback || '' }}
+      dry_run: ${{ inputs.dry_run || false }}
+      app_id: ${{ vars.APPINSIGHTS_APP_ID }}
+      api_base_url: ${{ vars.API_BASE_URL }}
+      health_path: ${{ vars.HEALTH_PATH || '/health' }}   # ← e.g. /api/public/health
+      frontend_url: ${{ vars.FRONTEND_URL }}
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      AZURE_MONITOR_CREDENTIALS: ${{ secrets.AZURE_MONITOR_CREDENTIALS }}

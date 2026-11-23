@@ -1,0 +1,10 @@
+// Server errors (5xx) per operation. 4xx are excluded: auth failures are normal noise.
+requests
+| where timestamp > ago({{LOOKBACK}})
+| summarize total = count(), failed = countif(toint(resultCode) >= 500),
+            resultCodes = make_set_if(resultCode, toint(resultCode) >= 500, 5),
+            samples = make_set_if(operation_Id, toint(resultCode) >= 500, 3)
+  by operation_Name
+| where failed >= 3 or (total >= 20 and todouble(failed) / total > 0.02)
+| extend key = operation_Name
+| order by failed desc

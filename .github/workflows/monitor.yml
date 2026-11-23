@@ -1,0 +1,215 @@
+name: Live Site Monitor (reusable)
+
+# Stage A (always, ~1 min, no LLM): synthetic checks + App Insights KQL anomaly queries,
+#   each anomaly fingerprinted (scripts/monitor-sweep.sh).
+# Dedupe against open `monitoring` issues; suppressions expire after 14 days
+#   (scripts/monitor-dedupe.sh).
+# Stage B (only for NEW anomalies): Claude investigates read-only (telemetry drill-down,
+#   code, recent deploys) and writes incidents.json; scripts/monitor-post.sh files the
+#   issues and lists noise in one "Monitoring: suppressed signals" issue. Never auto-fixes.
+# Called from a thin workflow in each repo (see examples/monitor.yml). The caller owns the
+# triggers and passes its repo variables as inputs.
+#
+# Per-repo, optional:
+#   .github/claude/investigate-extra.md   project context for the investigator
+#   <queries_dir>/*.kql                   extra queries; a same-named file overrides the shared one
+
+on:
+  workflow_call:
+    inputs:
+      lookback:
+        description: Window to inspect (30m / 6h / 1d). Empty = 30m after a deploy, else 6h.
+        type: string
+        default: ''
+      dry_run:
+        description: Print the issues/comments instead of creating them.
+        type: boolean
+        default: false
+      app_id:
+        description: App Insights application id (caller passes vars.APPINSIGHTS_APP_ID). Empty = not configured.
+        type: string
+        default: ''
+      api_base_url:
+        description: Backend base URL for the health check (vars.API_BASE_URL). Empty = skip.
+        type: string
+        default: ''
+      health_path:
+        description: Health endpoint path on api_base_url (vars.HEALTH_PATH).
+        type: string
+        default: /health
+      frontend_url:
+        description: Frontend URL for the synthetic check (vars.FRONTEND_URL). Empty = skip.
+        type: string
+        default: ''
+      queries_dir:
+        description: Repo dir with extra/override .kql files.
+        type: string
+        default: .github/claude/monitor-queries
+      max_turns:
+        type: number
+        default: 40
+      automation_ref:
+        description: Ref of grubman/claude-automation to load scripts/prompts from. Keep equal to the @ref in `uses:`.
+        type: string
+        default: v1
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+      AZURE_MONITOR_CREDENTIALS:
+        description: Service principal JSON (az ad sp create-for-rbac --json-auth) with Monitoring Reader on the App Insights resource.
+        required: false
+
+jobs:
+  monitor:
+    # Never after a PR's test run or a failed deploy (the caller should gate too).
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    concurrency:
+      group: live-site-monitor-${{ github.repository }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      APP_ID: ${{ inputs.app_id }}
+      API_BASE_URL: ${{ inputs.api_base_url }}
+      HEALTH_PATH: ${{ inputs.health_path }}
+      FRONTEND_URL: ${{ inputs.frontend_url }}
+      LOOKBACK: ${{ inputs.lookback || (github.event_name == 'workflow_run' && '30m') || '6h' }}
+      DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+      OUT: .claude-out
+      QUERIES_DIR: .claude-out/monitor-queries
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    steps:
+      - name: Check configuration
+        id: cfg
+        env:
+          HAS_CREDS: ${{ secrets.AZURE_MONITOR_CREDENTIALS != '' }}
+        run: |
+          if [ -z "$APP_ID" ] || [ "$HAS_CREDS" != "true" ]; then
+            echo "::notice::Monitoring not configured yet (APPINSIGHTS_APP_ID var / AZURE_MONITOR_CREDENTIALS secret). See the grubman/claude-automation README."
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v5
+        if: steps.cfg.outputs.ok == '1'
+        with:
+          fetch-depth: 100   # investigator correlates anomalies with recent commits
+
+      - name: Load automation scripts
+        if: steps.cfg.outputs.ok == '1'
+        uses: actions/checkout@v5
+        with:
+          repository: grubman/claude-automation
+          ref: ${{ inputs.automation_ref }}
+          path: .claude-automation
+          persist-credentials: false
+      - if: steps.cfg.outputs.ok == '1'
+        run: mv .claude-automation "$RUNNER_TEMP/claude-automation" && echo "AUTOMATION=$RUNNER_TEMP/claude-automation" >> "$GITHUB_ENV"
+
+      - name: Assemble queries
+        if: steps.cfg.outputs.ok == '1'
+        env:
+          PROJECT_QUERIES: ${{ inputs.queries_dir }}
+        run: |
+          mkdir -p "$QUERIES_DIR"
+          cp "$AUTOMATION"/monitor-queries/*.kql "$QUERIES_DIR"/
+          if [ -d "$PROJECT_QUERIES" ]; then
+            for f in "$PROJECT_QUERIES"/*.kql; do
+              [ -e "$f" ] || continue
+              if [ -e "$QUERIES_DIR/$(basename "$f")" ]; then echo "project override: $(basename "$f")"; else echo "project query: $(basename "$f")"; fi
+              cp "$f" "$QUERIES_DIR"/
+            done
+          fi
+          ls "$QUERIES_DIR"
+
+      - name: Azure login (read-only monitoring principal)
+        if: steps.cfg.outputs.ok == '1'
+        uses: azure/login@v3
+        with:
+          creds: ${{ secrets.AZURE_MONITOR_CREDENTIALS }}
+          allow-no-subscriptions: true   # principal is scoped to the App Insights resource only
+
+      - name: Sweep
+        id: sweep
+        if: steps.cfg.outputs.ok == '1'
+        run: |
+          az extension add --name application-insights --yes --only-show-errors
+          bash "$AUTOMATION/scripts/monitor-sweep.sh"
+          jq . "$OUT/anomalies.json"
+
+      - name: Dedupe against open monitoring issues
+        id: dedupe
+        if: steps.cfg.outputs.ok == '1' && steps.sweep.outputs.count != '0'
+        run: bash "$AUTOMATION/scripts/monitor-dedupe.sh"
+
+      - name: Build prompt
+        id: prompt
+        if: steps.dedupe.outputs.new != '' && steps.dedupe.outputs.new != '0'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          delim="PROMPT_$(openssl rand -hex 8)"
+          {
+            echo "text<<${delim}"
+            cat "$AUTOMATION/prompts/investigate.md"
+            if [ -f .github/claude/investigate-extra.md ]; then
+              echo
+              echo "## Project context"
+              cat .github/claude/investigate-extra.md
+            fi
+            echo
+            echo "## This run"
+            echo "- Repository: ${REPO}"
+            echo "- App Insights app id: ${APP_ID}"
+            echo "- Lookback: ${LOOKBACK} (now: $(date -u +%FT%TZ))"
+            echo "- Trigger: ${EVENT_NAME}"
+            echo "${delim}"
+          } >> "$GITHUB_OUTPUT"
+
+      - id: claude
+        if: steps.prompt.outcome == 'success'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The investigator never writes to GitHub itself (a later step files issues).
+          github_token: ${{ github.token }}
+          claude_args: >-
+            --max-turns ${{ inputs.max_turns }}
+            --allowedTools "Read,Glob,Grep,Write,Bash(az monitor app-insights query:*),Bash(git log:*),Bash(git show:*),Bash(gh run list:*),Bash(gh run view:*),Bash(jq:*),Bash(mkdir:*)"
+            --disallowedTools "Edit,WebFetch,WebSearch"
+          prompt: ${{ steps.prompt.outputs.text }}
+
+      # On the usage limit, don't file raw anomalies: they stay untracked, so the next
+      # scheduled sweep finds them as "new" again and retries the investigation.
+      - name: Pause on usage limit
+        id: pause
+        if: ${{ !cancelled() && steps.prompt.outcome == 'success' }}
+        env:
+          KIND: monitor
+          RUN_ID: ${{ github.run_id }}
+          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
+        run: bash "$AUTOMATION/scripts/pause.sh"
+
+      - name: File incidents
+        if: ${{ !cancelled() && steps.prompt.outcome == 'success' && steps.pause.outputs.paused != '1' }}
+        run: bash "$AUTOMATION/scripts/monitor-post.sh"
+
+      - name: Upload sweep output
+        if: ${{ !cancelled() && steps.cfg.outputs.ok == '1' }}
+        uses: actions/upload-artifact@v5
+        with:
+          name: monitor-${{ github.run_id }}
+          path: .claude-out/
+          retention-days: 14
+          if-no-files-found: ignore
