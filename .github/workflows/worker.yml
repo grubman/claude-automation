@@ -12,6 +12,10 @@ on:
         description: Claude model; empty = the action's default.
         type: string
         default: ''
+      fix_model:
+        description: Claude model for FIX MODE (PR fix rounds); empty = same as `model`.
+        type: string
+        default: ''
       max_turns:
         type: number
         default: 60
@@ -111,7 +115,7 @@ jobs:
           (the one containing '<!-- claude-review') with: gh pr view ${NUMBER} --repo ${REPO} --comments
           and any failing checks: gh pr checks ${NUMBER} --repo ${REPO}, then gh run view <run-id> --repo ${REPO} --log-failed
           Fix every CI failure and every finding, blockers and majors first. Fix minor findings too unless one is clearly out of this PR's scope; for any you skip, say why in your reply.
-          Also do any earlier request from a human in the PR comments that no reply from Claude has addressed yet." ;;
+          Also do every request a human has made in the PR comments or reviews that no later commit has implemented yet. A reply from Claude that declined or deferred a human request does not count as addressing it." ;;
             *)
               trigger="Triggering comment:
           ${TRIGGER_COMMENT}" ;;
@@ -166,8 +170,13 @@ jobs:
           2. Read the PR and its linked issue: \`gh pr view ${NUMBER} --comments\`, \`gh pr diff ${NUMBER}\`.
           3. Make the smallest changes that address the points above.
              - A request a HUMAN makes explicitly (in a comment or review on this PR) is in scope by
-               definition, even if it widens the PR: implement it. Push back only if it would break
-               CLAUDE.md rules or is unsafe, and then explain why in your reply.
+               definition, even if it widens the PR: implement it IN THIS ROUND. Push back only if it
+               would break CLAUDE.md rules or is unsafe, and then explain why in your reply.
+               "Not added in this round", "can be a follow-up" or "covered indirectly" are NOT
+               acceptable answers to a human request: if you run short of time, commit and push what
+               you have and say exactly what is left, rather than skipping it.
+             - Do human requests BEFORE investigating anything else (flaky tests, minor findings),
+               so they can't be crowded out of the run.
              - For automated review findings, stay within the PR's scope; if you disagree with one,
                don't change code for it and explain why in your reply.
           4. Add or update tests for every behavior change.
@@ -278,7 +287,7 @@ jobs:
           restrict_untrusted_prs: false
           claude_args: >-
             --max-turns ${{ inputs.max_turns }}
-            ${{ inputs.model != '' && format('--model {0}', inputs.model) || '' }}
+            ${{ steps.ctx.outputs.mode == 'pr' && inputs.fix_model != '' && format('--model {0}', inputs.fix_model) || (inputs.model != '' && format('--model {0}', inputs.model) || '') }}
             --permission-mode bypassPermissions
             --disallowedTools "WebFetch,WebSearch,Monitor"
             ${{ steps.restore.outputs.args }}
