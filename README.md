@@ -7,7 +7,7 @@ prompts live here.
 
 | Reusable workflow | Caller (keep the name) | What it does |
 |---|---|---|
-| `worker.yml` | `claude.yml` | Issue labeled `claude` → builds it on `claude/issue-<n>-<slug>` and opens a PR. On a PR (Claude mention, "Request changes" on a `claude/*` PR, or `claude-fix` label) → pushes fixes to the same branch. |
+| `worker.yml` | `claude.yml` | Issue labeled `claude` → builds it on `claude/issue-<n>-<slug>` and opens a PR. On a PR (Claude mention, "Request changes" on a `claude/*` PR, or `claude-fix` label) → pushes fixes to the same branch (optional `fix_model` input: a stronger model for fix rounds). |
 | `review.yml` | `claude-review.yml` | Reviews every non-draft PR after CI; posts one sticky **Bottom line** (✅ / ⚠️ / ❌) and a `review:*` label. Starts bounded auto-fix rounds on `claude/*` PRs. |
 | `plan.yml` | `claude-plan.yml` | Issue labeled `claude-epic` → proposes ordered, PR-sized sub-issues; `/approve` creates them. `claude-epic-auto` skips the approval. |
 | `dispatch.yml` | `claude-dispatch.yml` | When a sub-issue closes, labels the next ready ones `claude` (capped in parallel); closes the epic when all are done. |
