@@ -85,6 +85,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          echo "JOB_START=$(date -u +%s)" >> "$GITHUB_ENV"   # for the Claude step's time budget
           mode=issue
           if [ "$EVENT_NAME" != "issues" ] && { [ "$EVENT_NAME" != "issue_comment" ] || [ "$IS_PR_COMMENT" = "true" ]; }; then
             mode="pr"
@@ -244,7 +245,26 @@ jobs:
           RESUME_SESSION: ${{ steps.resume.outputs.session }}
         run: bash "$AUTOMATION/scripts/resume-prepare.sh"
 
+      # The job's timeout-minutes kills the job outright: every follow-up step below is skipped,
+      # so the work is lost and the issue is left labeled `claude` with nobody working on it.
+      # Give the Claude step its own, shorter timeout instead (what is left of the job's budget,
+      # minus a reserve for the steps after it). A step timeout is a normal failure, so the
+      # follow-up steps still run and pause.sh saves the progress and resumes the run.
+      - name: Claude time budget
+        id: budget
+        env:
+          JOB_TIMEOUT: ${{ inputs.timeout_minutes }}
+          RESERVE: 4
+        run: |
+          elapsed=$(( ($(date -u +%s) - ${JOB_START:-$(date -u +%s)}) / 60 ))
+          minutes=$(( JOB_TIMEOUT - elapsed - RESERVE ))
+          [ "$minutes" -ge 3 ] || minutes=3
+          echo "minutes=$minutes" >> "$GITHUB_OUTPUT"
+          echo "start=$(date -u +%s)" >> "$GITHUB_OUTPUT"
+          echo "Claude step budget: ${minutes} min (job timeout ${JOB_TIMEOUT}, ${elapsed} min used)"
+
       - id: claude
+        timeout-minutes: ${{ fromJSON(steps.budget.outputs.minutes) }}
         uses: anthropics/claude-code-action@v1
         env:
           # Headless run: a backgrounded command outlives the session, which then ends before the push.
@@ -275,6 +295,8 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
           PREV_ATTEMPT: ${{ steps.resume.outputs.attempt }}
+          CLAUDE_START: ${{ steps.budget.outputs.start }}
+          CLAUDE_BUDGET_MIN: ${{ steps.budget.outputs.minutes }}
         run: bash "$AUTOMATION/scripts/pause.sh"
 
       - name: Save paused session

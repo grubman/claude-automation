@@ -56,7 +56,7 @@ out "args=$args"
 delim="P_$(openssl rand -hex 6)"
 {
   echo "prefix<<${delim}"
-  echo "RESUMED RUN: a previous run on this task stopped because the Claude usage limit was reached."
+  echo "RESUMED RUN: a previous run on this task stopped before finishing (Claude usage limit or its time budget)."
   echo "Restored: ${restored[*]:-nothing (start over, but check git branches and .claude-out/ first)}."
   echo "Continue from where you left off — check \`git status\`, \`git log -3\` and .claude-out/notes.md"
   echo "before redoing anything. The original instructions follow."

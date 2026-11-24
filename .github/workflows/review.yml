@@ -172,7 +172,8 @@ jobs:
           ref: ${{ inputs.automation_ref }}
           path: .claude-automation
           persist-credentials: false
-      - run: mv .claude-automation "$RUNNER_TEMP/claude-automation" && echo "AUTOMATION=$RUNNER_TEMP/claude-automation" >> "$GITHUB_ENV"
+      - if: steps.ctx.outputs.skip == '0'
+        run: mv .claude-automation "$RUNNER_TEMP/claude-automation" && echo "AUTOMATION=$RUNNER_TEMP/claude-automation" >> "$GITHUB_ENV"
 
       - name: Collect PR facts
         if: steps.ctx.outputs.skip == '0'
