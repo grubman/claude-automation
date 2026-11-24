@@ -42,8 +42,14 @@ tail_text="$(jq -r '
   ([.[] | select(.type == "result")] | last | (.result // "") + " " + ((.errors // []) | tostring)),
   ([.[] | select(.type == "assistant")] | last | .message.content[]? | select(.type == "text") | .text)
 ' "$EXEC" 2>/dev/null | tail -c 2000 || true)"
+# Structured signal first: the CLI records a rate_limit_event; a "rejected" one means the run was
+# stopped by the usage limit, and it carries the exact reset time. The message text varies
+# ("hit your usage limit", "hit your 5-hour limit · resets 4:30pm (UTC)", …), so it's only a fallback.
+limit_reset="$(jq -r '[.[] | select(.type == "rate_limit_event" and .rate_limit_info.status == "rejected")]
+  | last | .rate_limit_info.resetsAt // empty' "$EXEC" 2>/dev/null || true)"
 if [ -z "$reason" ]; then
-  if ! grep -Eiq 'usage limit|hit your (usage )?limit|limit (reached|will reset)|out of (extra )?usage|rate_limit_error' <<<"$tail_text"; then
+  if [ -z "$limit_reset" ] &&
+     ! grep -Eiq 'usage limit|hit your ([a-z0-9-]+ )?limit|limit (reached|will reset)|out of (extra )?usage|rate_limit_error' <<<"$tail_text"; then
     log "Claude step failed for a reason other than the usage limit"
     finish 0 0
   fi
@@ -61,7 +67,9 @@ now="$(date -u +%s)"
 
 # ── When to retry: the reset time if the message has one, else exponential backoff. ──
 reset=""
-if epoch="$(grep -oE '\|[0-9]{10}' <<<"$tail_text" | head -n1 | tr -d '|')" && [ -n "$epoch" ]; then
+if [[ "${limit_reset:-}" =~ ^[0-9]{10}$ ]]; then
+  reset=$((limit_reset + 300))
+elif epoch="$(grep -oE '\|[0-9]{10}' <<<"$tail_text" | head -n1 | tr -d '|')" && [ -n "$epoch" ]; then
   reset=$((epoch + 300))
 elif t="$(grep -oEi 'resets( at)? [0-9]{1,2}(:[0-9]{2})? ?[ap]m' <<<"$tail_text" | head -n1 | sed -E 's/resets( at)? //I')" && [ -n "$t" ]; then
   tz="$({ grep -oE '\(([A-Za-z_]+/[A-Za-z_]+|UTC)\)' <<<"$tail_text" || true; } | head -n1 | tr -d '()')"   # message may omit the timezone
