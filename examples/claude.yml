@@ -26,6 +26,7 @@ jobs:
       node_version: '22.x'                      # ← '' to skip
       cache_dependency_path: package-lock.json  # ← lockfile(s), newline-separated
       setup_command: npm ci                     # ← '' to let Claude install per CLAUDE.md
+      # deps_cache_paths: node_modules          # optional: skip setup_command on an exact cache hit
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}
