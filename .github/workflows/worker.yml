@@ -34,6 +34,19 @@ on:
         description: Shell command run before Claude (e.g. "npm ci"); empty = none.
         type: string
         default: npm ci
+      deps_cache_paths:
+        description: >-
+          Newline-separated paths (e.g. node_modules dirs) to cache AFTER `setup_command`.
+          On an exact cache hit `setup_command` is skipped. Empty = no cache (default).
+        type: string
+        default: ''
+      deps_cache_key_files:
+        description: >-
+          Newline-separated git pathspecs whose contents key that cache (lockfiles plus
+          anything `setup_command` reads, e.g. patches or a Prisma schema).
+          Empty = `cache_dependency_path`.
+        type: string
+        default: ''
       automation_ref:
         type: string
         default: v1
@@ -219,9 +232,41 @@ jobs:
           node-version: ${{ inputs.node_version }}
           cache: ${{ inputs.cache_dependency_path != '' && 'npm' || '' }}
           cache-dependency-path: ${{ inputs.cache_dependency_path }}
+      # Optional exact-match cache of the installed dependencies (deps_cache_paths). Saved
+      # right after the install, before Claude runs, so a session that installs a package
+      # can never write a modified tree under the lockfile's key. No restore-keys: a
+      # partial match would skip the install with the wrong tree.
+      - name: Dependency cache key
+        id: depkey
+        if: inputs.deps_cache_paths != '' && inputs.setup_command != ''
+        env:
+          KEY_FILES: ${{ inputs.deps_cache_key_files || inputs.cache_dependency_path }}
+          SETUP: ${{ inputs.setup_command }}
+        run: |
+          set -euo pipefail
+          mapfile -t pats < <(printf '%s\n' "$KEY_FILES" | sed -e 's/^[[:space:]]*//' -e '/^$/d')
+          [ "${#pats[@]}" -gt 0 ] || { echo "No key files: cache disabled"; exit 0; }
+          # git ls-files -s lists each tracked file's blob hash, so the key changes with content.
+          h=$( { printf '%s\n' "$SETUP" "$RUNNER_OS" "$(node --version 2>/dev/null || true)"; git ls-files -s -- "${pats[@]}"; } \
+            | sha256sum | cut -c1-40)
+          echo "key=claude-deps-$h" >> "$GITHUB_OUTPUT"
+      - name: Restore dependencies
+        id: depcache
+        if: steps.depkey.outputs.key != ''
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ inputs.deps_cache_paths }}
+          key: ${{ steps.depkey.outputs.key }}
       - name: Install dependencies
-        if: inputs.setup_command != ''
+        if: inputs.setup_command != '' && steps.depcache.outputs.cache-hit != 'true'
         run: ${{ inputs.setup_command }}
+      - name: Save dependencies
+        if: steps.depkey.outputs.key != '' && steps.depcache.outputs.cache-hit != 'true'
+        continue-on-error: true   # e.g. a parallel run saved the same key first
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ inputs.deps_cache_paths }}
+          key: ${{ steps.depkey.outputs.key }}
 
       # ── Resume a run paused by the Claude usage limit (no-op otherwise) ──
       - name: Find paused session
