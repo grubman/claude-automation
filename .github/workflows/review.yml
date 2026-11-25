@@ -9,6 +9,7 @@ name: Claude PR Review (reusable)
 # - PRs that no CI workflow covers are reviewed on the pull_request event directly.
 # - `/review` comment (collaborators) or workflow_dispatch forces a re-review.
 # - claude/* PRs that aren't ready get up to `max_fix_rounds` auto-fix rounds (adds `claude-fix`).
+#   A ready PR with minor findings gets one polish round unless `auto_fix_minor: false`.
 #
 # Per-repo, optional, read from the PR's BASE branch:
 #   .github/claude/checks.sh        extra deterministic flags (see scripts/pr-facts.sh)
@@ -39,6 +40,13 @@ on:
       max_fix_rounds:
         type: number
         default: 2
+      auto_fix_minor:
+        description: >-
+          Also start one polish round when the first review is "ready" but lists minor
+          findings. Each round costs a worker run plus CI and another review; set false to
+          leave minor findings to a human (add `claude-fix` to send a round).
+        type: boolean
+        default: true
       automation_ref:
         description: Ref of grubman/claude-automation to load scripts/prompts from. Keep equal to the @ref in `uses:`.
         type: string
@@ -247,6 +255,6 @@ jobs:
           HEAD_REF: ${{ steps.ctx.outputs.ref }}
           CI_CONCLUSION: ${{ steps.ctx.outputs.ci_conclusion }}
           AUTO_FIX: ${{ inputs.auto_fix && (secrets.AUTOMATION_PAT != '') && '1' || '0' }}
-          AUTO_FIX_MINOR: ${{ inputs.auto_fix && '1' || '0' }}
+          AUTO_FIX_MINOR: ${{ inputs.auto_fix && inputs.auto_fix_minor && '1' || '0' }}
           MAX_FIX_ROUNDS: ${{ inputs.max_fix_rounds }}
         run: bash "$AUTOMATION/scripts/post-review.sh" .claude-out/review.json
