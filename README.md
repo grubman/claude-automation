@@ -13,11 +13,12 @@ prompts live here.
 | `dispatch.yml` | `claude-dispatch.yml` | When a sub-issue closes, labels the next ready ones `claude` (capped in parallel); closes the epic when all are done. |
 | `resume.yml` | `claude-resume.yml` | When Claude asked a question (`claude-needs-input` / `claude-plan-proposed`), your reply re-runs the right flow. |
 | `unpause.yml` | `claude-unpause.yml` | Runs paused by the Claude usage limit resume automatically after the reset. |
+| `monitor.yml` | `monitor.yml` | Live-site monitor (every 6h, after each deploy, manual): health check + App Insights KQL sweep with no LLM; Claude investigates only new anomalies and files `monitoring` issues. Never auto-fixes. |
+| `deps-cache.yml` | `claude-deps-cache.yml` | Optional, with the worker's `deps_cache_paths`: fills the installed-dependencies cache on the default branch (push to a key file, daily, manual). Needed because worker runs started by an issue or comment can restore a cache but not save one. Pass the same setup inputs as `claude.yml`. |
 
 A worker run whose Claude step uses up its time budget (`timeout_minutes`, minus a few minutes kept for
 the follow-up steps) is not lost: its progress is saved the same way as a usage-limit pause and the run
 resumes immediately, at most twice (`MAX_TIMEOUT_RESUMES`). After that the issue gets `claude-failed`.
-| `monitor.yml` | `monitor.yml` | Live-site monitor (every 6h, after each deploy, manual): health check + App Insights KQL sweep with no LLM; Claude investigates only new anomalies and files `monitoring` issues. Never auto-fixes. |
 
 Safety nets: `claude-hold` stops anything; agents never push to the default branch, edit
 `.github/workflows/`, or commit secrets; reviews never run on fork PRs.
