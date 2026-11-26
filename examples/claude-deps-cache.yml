@@ -1,0 +1,23 @@
+# Copy to .github/workflows/claude-deps-cache.yml when the worker caller (claude.yml) sets
+# deps_cache_paths. Keep every `with:` value identical to claude.yml: they are part of the key.
+name: Claude worker dependency cache
+
+on:
+  push:
+    branches: [main]
+    paths:                       # the deps_cache_key_files (or cache_dependency_path)
+      - package-lock.json
+  schedule:
+    - cron: '17 4 * * *'         # daily: a new Node patch release changes the key
+  workflow_dispatch:
+
+jobs:
+  warm:
+    uses: grubman/claude-automation/.github/workflows/deps-cache.yml@v1
+    permissions:
+      contents: read
+    with:
+      node_version: '22.x'
+      cache_dependency_path: package-lock.json
+      setup_command: npm ci
+      deps_cache_paths: node_modules

@@ -1,0 +1,82 @@
+name: Claude worker dependency cache (reusable)
+
+# Fills the worker's installed-dependencies cache (worker.yml `deps_cache_paths`) on the
+# default branch. Worker runs started by an issue or a comment can restore a default-branch
+# cache but can't save one (GitHub denies the write: "token has no writable scopes"), so
+# without this job they never get a hit. Run it on push to the default branch when a key file
+# changes, plus on a daily schedule (a new Node patch release changes the key too).
+# Pass EXACTLY the same node_version / setup_command / deps_cache_* values as the worker
+# caller: they are part of the key. The caller is examples/claude-deps-cache.yml.
+
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        type: string
+        default: '22.x'
+      cache_dependency_path:
+        description: Lockfile path(s) for setup-node's npm download cache; empty = none.
+        type: string
+        default: package-lock.json
+      setup_command:
+        type: string
+        default: npm ci
+      deps_cache_paths:
+        type: string
+        required: true
+      deps_cache_key_files:
+        description: Empty = `cache_dependency_path`, as in worker.yml.
+        type: string
+        default: ''
+      automation_ref:
+        type: string
+        default: v1
+
+jobs:
+  warm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Load automation scripts
+        uses: actions/checkout@v5
+        with:
+          repository: grubman/claude-automation
+          ref: ${{ inputs.automation_ref }}
+          path: .claude-automation
+          persist-credentials: false
+      - run: mv .claude-automation "$RUNNER_TEMP/claude-automation" && echo "AUTOMATION=$RUNNER_TEMP/claude-automation" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v5
+        if: inputs.node_version != ''
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: ${{ inputs.cache_dependency_path != '' && 'npm' || '' }}
+          cache-dependency-path: ${{ inputs.cache_dependency_path }}
+      - name: Dependency cache key
+        id: depkey
+        env:
+          KEY_FILES: ${{ inputs.deps_cache_key_files || inputs.cache_dependency_path }}
+          SETUP: ${{ inputs.setup_command }}
+        run: bash "$AUTOMATION/scripts/deps-cache-key.sh"
+      # Already cached → stop here (seconds, no download).
+      - name: Look up cache
+        id: lookup
+        if: steps.depkey.outputs.key != ''
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ inputs.deps_cache_paths }}
+          key: ${{ steps.depkey.outputs.key }}
+          lookup-only: true
+      - name: Install dependencies
+        if: steps.depkey.outputs.key != '' && steps.lookup.outputs.cache-hit != 'true'
+        run: ${{ inputs.setup_command }}
+      - name: Save dependencies
+        if: steps.depkey.outputs.key != '' && steps.lookup.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ inputs.deps_cache_paths }}
+          key: ${{ steps.depkey.outputs.key }}
